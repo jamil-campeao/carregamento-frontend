@@ -3,151 +3,150 @@ import { ChargingStation, type ChargingStationData } from "./components/Charging
 import { EventLog, type EventLogEntry } from "./components/EventLog";
 import { ControlPanel } from "./components/ControlPanel";
 
+const API_BASE_URL = "http://72.60.12.191:8000/api"
+const TOKEN = import.meta.env.VITE_API_TOKEN
+const WEB_SOCKET_URL = `ws://72.60.12.191:8000/ws?token=${TOKEN}`
+
 export default function App() {
+  const [stations, setStations] = useState<ChargingStationData[]>([]);
   const [lamportClock, setLamportClock] = useState(0);
-  const [stations, setStations] = useState<ChargingStationData[]>([
-    { id: "CARREGADOR_01", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
-    { id: "CARREGADOR_02", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
-    { id: "CARREGADOR_03", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
-    { id: "CARREGADOR_04", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
-    { id: "CARREGADOR_05", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
-    { id: "CARREGADOR_06", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
-  ]);
-  const [events, setEvents] = useState<EventLogEntry[]>([]);
   const [vehicleQueue, setVehicleQueue] = useState<string[]>([]);
+  const [events, setEvents] = useState<EventLogEntry[]>([]);
   const [isSimulationRunning, setIsSimulationRunning] = useState(false);
 
-  // ALTERAÇÃO 1: Função de incremento do relógio simplificada.
-  // Ela agora apenas atualiza o estado e não retorna um valor, evitando o "stale closure".
-  // A dependência foi removida, pois a função updater (prev => ...) já garante o valor mais recente.
-  const incrementLamportClock = useCallback(() => {
-    setLamportClock(prev => prev + 1);
+  const fetchInitialState = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/estado-inicial`, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `${TOKEN}`
+        }
+      }
+      );
+
+      if (!response.ok) {
+        throw new Error("Falha ao buscar estado inicial");
+      }
+
+      const data = await response.json();
+      console.log(data)
+
+      const stationsArray = Object.values(data.carregadores || {}) as ChargingStationData[];
+      setStations(stationsArray);
+
+      const eventsArray = (data.eventos || []).map((event: any) => ({
+        ...event,
+        createdAt: new Date()
+      }));
+    setEvents(eventsArray);
+    } catch (error) {
+      console.error("Erro ao carregar dados iniciais:", error);
+      // Inicia com um estado padrão em caso de erro, para a UI não quebrar
+      setStations([
+        { id: "CARREGADOR_01", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
+        { id: "CARREGADOR_02", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
+        { id: "CARREGADOR_03", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
+        { id: "CARREGADOR_04", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
+        { id: "CARREGADOR_05", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
+        { id: "CARREGADOR_06", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
+      ]);
+    }
   }, []);
 
-  // ALTERAÇÃO 2: A função `addEvent` agora gerencia a atualização do relógio.
-  // Ela recebe o novo valor do timestamp diretamente do `setLamportClock` updater.
-  const addEvent = useCallback((source: string, description: string) => {
-    let eventTimestamp = 0;
-    setLamportClock(prevClock => {
-      const newClock = prevClock + 1;
-      eventTimestamp = newClock; // Captura o novo valor do relógio
-      return newClock;
-    });
+  useEffect(() => {
+    fetchInitialState();
+  }, [fetchInitialState]);
 
-    const newEvent: EventLogEntry = {
-      id: `event_${eventTimestamp}_${Date.now()}`,
-      timestamp: eventTimestamp,
-      source,
-      description,
-      createdAt: new Date(),
+  // Efeito para gerenciar a conexão WebSocket
+  useEffect(() => {
+    const ws = new WebSocket(WEB_SOCKET_URL);
+
+    ws.onopen = () => {
+      console.log("Conectado ao servidor WebSocket.");
     };
-    setEvents(prev => [newEvent, ...prev]);
-    return eventTimestamp; // Retorna o timestamp correto e atualizado
-  }, []); // Dependências vazias, pois `setLamportClock` e `setEvents` são estáveis.
 
-  const addVehicle = useCallback((vehicleId: string) => {
-    if (!vehicleQueue.includes(vehicleId)) {
-      setVehicleQueue(prev => [...prev, vehicleId]);
-      addEvent("API_Gateway", `Novo veículo '${vehicleId}' solicitou carregamento`);
-    }
-  }, [vehicleQueue, addEvent]);
+    ws.onmessage = (event) => {
+      console.log("Mensagem recebida:", event);
+      const message = JSON.parse(event.data);
+      const { topic, payload } = message;
 
-  const startCharging = useCallback((vehicleId: string, stationId: string) => {
-    const timestamp = addEvent(stationId, `Iniciou o carregamento do '${vehicleId}'`);
-
-    setStations(prev =>
-      prev.map(station =>
-        station.id === stationId
-          ? { ...station, status: "Carregando", vehicleId, batteryLevel: 0, lamportTimestamp: timestamp }
-          : station
-      )
-    );
-
-    setVehicleQueue(prev => prev.filter(id => id !== vehicleId));
-  }, [addEvent]);
-
-  const stopCharging = useCallback((stationId: string) => {
-    const station = stations.find(s => s.id === stationId);
-    if (station && station.vehicleId) {
-      const timestamp = addEvent(stationId, `Carregamento do '${station.vehicleId}' finalizado`);
-
-      setStations(prev =>
-        prev.map(s =>
-          s.id === stationId
-            ? { ...s, status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: timestamp }
-            : s
-        )
-      );
-
-      // Simular faturamento
-      setTimeout(() => {
-        addEvent("Serviço_Faturamento", `Fatura gerada para '${station.vehicleId}'`);
-      }, 500);
-    }
-  }, [stations, addEvent]);
-
-  const toggleSimulation = useCallback(() => {
-    const nextIsRunning = !isSimulationRunning;
-    setIsSimulationRunning(nextIsRunning);
-    addEvent("Sistema", nextIsRunning ? "Simulação iniciada" : "Simulação pausada");
-  }, [isSimulationRunning, addEvent]);
-
-  // Simulação automática de progresso de carregamento
-  useEffect(() => {
-    if (!isSimulationRunning) return;
-
-    const interval = setInterval(() => {
-      setStations(prevStations =>
-        prevStations.map(station => {
-          if (station.status === "Carregando" && station.batteryLevel < 100) {
-            const newLevel = Math.min(station.batteryLevel + Math.random() * 5 + 2, 100);
-
-            // Adicionar evento de atualização de carga sem incrementar o relógio principal
-            // (geralmente, atualizações de status não precisam de um evento de log global)
-            // Se precisar, o addEvent deve ser chamado.
-            if (Math.floor(newLevel / 25) > Math.floor(station.batteryLevel / 25)) {
-              // A chamada ao addEvent foi mantida para seguir o comportamento original.
-              setTimeout(() => {
-                addEvent(station.id, `Atualização de carga: ${Math.floor(newLevel)}%`);
-              }, 100);
-            }
-
-            if (newLevel >= 100 && station.vehicleId) {
-              setTimeout(() => {
-                stopCharging(station.id);
-              }, 1000);
-            }
-
-            // Apenas o estado da estação é atualizado aqui, o relógio é atualizado nos eventos.
-            return { ...station, batteryLevel: newLevel };
+      if (topic.includes("status")) {
+        // Atualiza o estado de uma estação específica
+        setStations(prevStations => {
+          const stationExists = prevStations.some(station => station.id === payload.carregador);
+          if (stationExists) {
+            // Atualiza a estação existente
+            return prevStations.map(station =>
+              station.id === payload.carregador
+                ? {
+                    id: payload.carregador,
+                    status: payload.status === 'livre' ? 'Livre' : (payload.energia_consumida_kWh > 0 ? 'Carregando' : 'Ocupado'),
+                    vehicleId: payload.carro_conectado,
+                    batteryLevel: payload.energia_consumida_kWh, // Exemplo, idealmente o backend enviaria o nível da bateria
+                    lamportTimestamp: payload.timestamp || station.lamportTimestamp
+                  }
+                : station
+            );
+          } else {
+            // Adiciona a nova estação se ela não existir
+            return [...prevStations, {
+              id: payload.carregador,
+              status: payload.status === 'livre' ? 'Livre' : (payload.energia_consumida_kWh > 0 ? 'Carregando' : 'Ocupado'),
+              vehicleId: payload.carro_conectado,
+              batteryLevel: payload.energia_consumida_kWh,
+              lamportTimestamp: payload.timestamp || 0
+            }];
           }
-          return station;
-        })
-      );
-    }, 2000);
-
-    return () => clearInterval(interval);
-  }, [isSimulationRunning, addEvent, stopCharging]);
-
-  // ALTERAÇÃO 3: Lógica de alocação de veículos otimizada.
-  // Agora aloca todos os veículos possíveis para todas as estações livres de uma só vez.
-  useEffect(() => {
-    if (!isSimulationRunning || vehicleQueue.length === 0) return;
-
-    const freeStations = stations.filter(s => s.status === "Livre");
-    const vehiclesToCharge = vehicleQueue.slice(0, freeStations.length);
-
-    if (vehiclesToCharge.length > 0) {
-      const timeout = setTimeout(() => {
-        vehiclesToCharge.forEach((vehicleId, index) => {
-          const stationId = freeStations[index].id;
-          startCharging(vehicleId, stationId);
         });
-      }, 2000); // Aumentei o delay para ser mais visível na UI
+      } else if (topic.includes("eventos")) {
+        // Adiciona um novo evento ao log
+        const newEvent: EventLogEntry = {
+          id: `event_${payload.timestamp}_${Date.now()}`,
+          timestamp: payload.timestamp,
+          source: payload.carregador || payload.source,
+          description: `Ação: ${payload.acao} para o carro ${payload.carro}`,
+          createdAt: new Date(),
+        };
+        setEvents(prevEvents => [newEvent, ...prevEvents]);
+      }
+    };
 
-      return () => clearTimeout(timeout);
-    }
-  }, [isSimulationRunning, vehicleQueue, stations, startCharging]);
+    ws.onclose = () => {
+      console.log("Desconectado do servidor WebSocket.");
+    };
+
+    ws.onerror = (error) => {
+      console.error("Erro no WebSocket:", error);
+    };
+
+    // Função de limpeza para fechar a conexão ao desmontar o componente
+    return () => {
+      ws.close();
+    };
+  }, []); // O array de dependências vazio garante que isso rode apenas uma vez
+
+  // As funções de controle agora devem fazer chamadas à API em vez de simular
+  const addVehicle = useCallback(async (vehicleId: string) => {
+    // Esta funcionalidade precisará de um endpoint no backend
+    console.log("TODO: Implementar chamada de API para adicionar veículo à fila", vehicleId);
+  }, []);
+
+  const startCharging = useCallback(async (vehicleId: string, stationId: string) => {
+    // Esta funcionalidade precisará de um endpoint no backend
+     console.log("TODO: Implementar chamada de API para iniciar carregamento", vehicleId, stationId);
+  }, []);
+
+  const stopCharging = useCallback(async (stationId: string) => {
+     // Esta funcionalidade precisará de um endpoint no backend
+     console.log("TODO: Implementar chamada de API para parar carregamento", stationId);
+  }, []);
+
+  const toggleSimulation = useCallback(async () => {
+    // Esta funcionalidade precisará de um endpoint no backend
+    console.log("TODO: Implementar chamada de API para iniciar/parar simulação");
+  }, []);
+
 
   return (
     <div className="dark min-h-screen bg-background p-6">
