@@ -14,13 +14,14 @@ interface EventLogProps {
 }
 
 export function EventLog({ events }: EventLogProps) {
+  // A ordenação já garante que os eventos mais recentes (maior timestamp) apareçam primeiro.
   const sortedEvents = [...events].sort((a, b) => b.timestamp - a.timestamp);
 
-  const getSourceColor = (source: string) => {
-    if (source.includes("Carregador")) return "text-cyan-300";
-    if (source.includes("API_Gateway")) return "text-emerald-300";
-    if (source.includes("Serviço_Faturamento")) return "text-violet-300";
-    if (source.includes("Sistema")) return "text-amber-300";
+  const getSourceColor = (source?: string) => {
+    if (source?.includes("Carregador")) return "text-cyan-300";
+    if (source?.includes("API_Gateway")) return "text-emerald-300";
+    if (source?.includes("Serviço_Faturamento")) return "text-violet-300";
+    if (source?.includes("Sistema")) return "text-amber-300";
     return "text-slate-300";
   };
 
@@ -40,8 +41,12 @@ export function EventLog({ events }: EventLogProps) {
                 </span>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 mb-1">
-                    <span className={`font-medium text-sm ${getSourceColor(event.source)}`}>
-                      {event.source}
+                    <span
+                      className={`font-medium text-sm ${getSourceColor(
+                        event.source
+                      )}`}
+                    >
+                      {event.source || "Desconhecido"}
                     </span>
                     <span className="text-xs text-muted-foreground">
                       {event.createdAt.toLocaleTimeString()}
@@ -56,7 +61,8 @@ export function EventLog({ events }: EventLogProps) {
           ))}
           {sortedEvents.length === 0 && (
             <div className="text-center text-muted-foreground py-8">
-              Nenhum evento registrado ainda. Use os controles para iniciar a simulação.
+              Nenhum evento registrado ainda. Use os controles para iniciar a
+              simulação.
             </div>
           )}
         </div>

@@ -1,18 +1,20 @@
 import { useState, useEffect, useCallback } from "react";
-import { ChargingStation, type ChargingStationData } from "./components/ChargingStation";
+import {
+  ChargingStation,
+  type ChargingStationData,
+} from "./components/ChargingStation";
 import { EventLog, type EventLogEntry } from "./components/EventLog";
 import { ControlPanel } from "./components/ControlPanel";
 
-const API_BASE_URL = "http://72.60.12.191:8000/api"
-const TOKEN = import.meta.env.VITE_API_TOKEN
-const WEB_SOCKET_URL = `ws://72.60.12.191:8000/ws?token=${TOKEN}`
+const API_BASE_URL = "http://72.60.12.191:8000/api";
+const TOKEN = import.meta.env.VITE_API_TOKEN;
+const WEB_SOCKET_URL = `ws://72.60.12.191:8000/ws?token=${TOKEN}`;
 
 export default function App() {
   const [stations, setStations] = useState<ChargingStationData[]>([]);
-  const [lamportClock, setLamportClock] = useState(0);
-  const [vehicleQueue, setVehicleQueue] = useState<string[]>([]);
+  const [activeChargers, setActiveChargers] = useState<string[]>([]);
   const [events, setEvents] = useState<EventLogEntry[]>([]);
-  const [isSimulationRunning, setIsSimulationRunning] = useState(false);
+  const [isBillingRunning, setIsBillingRunning] = useState(false);
 
   const fetchInitialState = useCallback(async () => {
     try {
@@ -20,45 +22,90 @@ export default function App() {
         method: "GET",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `${TOKEN}`
-        }
-      }
-      );
+          Authorization: `${TOKEN}`,
+        },
+      });
 
       if (!response.ok) {
         throw new Error("Falha ao buscar estado inicial");
       }
 
       const data = await response.json();
-      console.log(data)
+      console.log("Estado inicial recebido:", data);
 
-      const stationsArray = Object.values(data.carregadores || {}) as ChargingStationData[];
+      const stationsData = data.carregadores || {};
+
+      const stationsArray = Object.values(stationsData).map((station: any) => ({
+        id: station.carregador,
+        status:
+          station.status === "livre"
+            ? "Livre"
+            : station.status === "offline"
+            ? "Offline"
+            : station.energia_consumida_kWh > 0
+            ? "Carregando"
+            : "Ocupado",
+        vehicleId: station.carro_conectado,
+        energiaConsumida: station.energia_consumida_kWh || 0,
+        lamportTimestamp: station.timestamp || 0,
+      }));
+
       setStations(stationsArray);
 
-      const eventsArray = (data.eventos || []).map((event: any) => ({
-        ...event,
-        createdAt: new Date()
-      }));
-    setEvents(eventsArray);
+      const eventsArray = (data.eventos || []).map(
+        (event: any): EventLogEntry => ({
+          id: `event_${event.timestamp || Date.now()}_${Math.random()}`,
+          timestamp: event.timestamp || 0,
+          source: event.carregador || event.source || "Sistema",
+          description: `Ação: ${event.acao || "Desconhecida"} para o carro ${
+            event.carro || "N/A"
+          }`,
+          createdAt: new Date(),
+        })
+      );
+      setEvents(eventsArray);
     } catch (error) {
       console.error("Erro ao carregar dados iniciais:", error);
-      // Inicia com um estado padrão em caso de erro, para a UI não quebrar
-      setStations([
-        { id: "CARREGADOR_01", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
-        { id: "CARREGADOR_02", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
-        { id: "CARREGADOR_03", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
-        { id: "CARREGADOR_04", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
-        { id: "CARREGADOR_05", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
-        { id: "CARREGADOR_06", status: "Livre", vehicleId: null, batteryLevel: 0, lamportTimestamp: 0 },
-      ]);
+      // CORREÇÃO: Em caso de erro, começamos com a lista vazia.
+      // A aplicação será populada via WebSocket à medida que os dados chegarem.
+      setStations([]);
+    }
+  }, []);
+
+  const fetchActiveChargers = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/carregadores/ativos`, {
+        headers: { Authorization: `${TOKEN}` },
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setActiveChargers(data.carregadores_ativos || []);
+      }
+    } catch (error) {
+      console.error("Erro ao buscar carregadores ativos:", error);
+    }
+  }, []);
+
+  const fetchBillingStatus = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/billing/status`, {
+        headers: { Authorization: `${TOKEN}` },
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setIsBillingRunning(data.status === "ativo");
+      }
+    } catch (error) {
+      console.error("Erro ao buscar status do billing:", error);
     }
   }, []);
 
   useEffect(() => {
     fetchInitialState();
-  }, [fetchInitialState]);
+    fetchActiveChargers();
+    fetchBillingStatus();
+  }, [fetchInitialState, fetchActiveChargers, fetchBillingStatus]);
 
-  // Efeito para gerenciar a conexão WebSocket
   useEffect(() => {
     const ws = new WebSocket(WEB_SOCKET_URL);
 
@@ -67,48 +114,51 @@ export default function App() {
     };
 
     ws.onmessage = (event) => {
-      console.log("Mensagem recebida:", event);
       const message = JSON.parse(event.data);
       const { topic, payload } = message;
 
       if (topic.includes("status")) {
-        // Atualiza o estado de uma estação específica
-        setStations(prevStations => {
-          const stationExists = prevStations.some(station => station.id === payload.carregador);
-          if (stationExists) {
+        setStations((prevStations) => {
+          const newStatus = {
+            id: payload.carregador,
+            status:
+              payload.status === "livre"
+                ? "Livre"
+                : payload.status === "offline"
+                ? "Offline"
+                : payload.energia_consumida_kWh > 0
+                ? "Carregando"
+                : "Ocupado",
+            vehicleId: payload.carro_conectado,
+            energiaConsumida: payload.energia_consumida_kWh || 0,
+            lamportTimestamp: payload.timestamp || 0,
+          };
+
+          const stationIndex = prevStations.findIndex(
+            (station) => station.id === payload.carregador
+          );
+
+          if (stationIndex > -1) {
             // Atualiza a estação existente
-            return prevStations.map(station =>
-              station.id === payload.carregador
-                ? {
-                    id: payload.carregador,
-                    status: payload.status === 'livre' ? 'Livre' : (payload.energia_consumida_kWh > 0 ? 'Carregando' : 'Ocupado'),
-                    vehicleId: payload.carro_conectado,
-                    batteryLevel: payload.energia_consumida_kWh, // Exemplo, idealmente o backend enviaria o nível da bateria
-                    lamportTimestamp: payload.timestamp || station.lamportTimestamp
-                  }
-                : station
-            );
+            const updatedStations = [...prevStations];
+            updatedStations[stationIndex] = newStatus;
+            return updatedStations;
           } else {
             // Adiciona a nova estação se ela não existir
-            return [...prevStations, {
-              id: payload.carregador,
-              status: payload.status === 'livre' ? 'Livre' : (payload.energia_consumida_kWh > 0 ? 'Carregando' : 'Ocupado'),
-              vehicleId: payload.carro_conectado,
-              batteryLevel: payload.energia_consumida_kWh,
-              lamportTimestamp: payload.timestamp || 0
-            }];
+            return [...prevStations, newStatus];
           }
         });
       } else if (topic.includes("eventos")) {
-        // Adiciona um novo evento ao log
         const newEvent: EventLogEntry = {
-          id: `event_${payload.timestamp}_${Date.now()}`,
-          timestamp: payload.timestamp,
-          source: payload.carregador || payload.source,
-          description: `Ação: ${payload.acao} para o carro ${payload.carro}`,
+          id: `event_${payload.timestamp || Date.now()}_${Math.random()}`,
+          timestamp: payload.timestamp || 0,
+          source: payload.carregador || payload.source || "Sistema",
+          description: `Ação: ${payload.acao || "Desconhecida"} para o carro ${
+            payload.carro || "N/A"
+          }`,
           createdAt: new Date(),
         };
-        setEvents(prevEvents => [newEvent, ...prevEvents]);
+        setEvents((prevEvents) => [newEvent, ...prevEvents]);
       }
     };
 
@@ -120,43 +170,119 @@ export default function App() {
       console.error("Erro no WebSocket:", error);
     };
 
-    // Função de limpeza para fechar a conexão ao desmontar o componente
     return () => {
       ws.close();
     };
-  }, []); // O array de dependências vazio garante que isso rode apenas uma vez
-
-  // As funções de controle agora devem fazer chamadas à API em vez de simular
-  const addVehicle = useCallback(async (vehicleId: string) => {
-    // Esta funcionalidade precisará de um endpoint no backend
-    console.log("TODO: Implementar chamada de API para adicionar veículo à fila", vehicleId);
   }, []);
 
-  const startCharging = useCallback(async (vehicleId: string, stationId: string) => {
-    // Esta funcionalidade precisará de um endpoint no backend
-     console.log("TODO: Implementar chamada de API para iniciar carregamento", vehicleId, stationId);
-  }, []);
+  const addCharger = useCallback(
+    async (chargerId: string) => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/carregadores`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `${TOKEN}`,
+          },
+          body: JSON.stringify({ carregador_id: chargerId }),
+        });
+        if (response.ok) {
+          fetchActiveChargers();
+        } else {
+          console.error("Falha ao iniciar carregador.");
+        }
+      } catch (error) {
+        console.error("Erro ao adicionar carregador:", error);
+      }
+    },
+    [fetchActiveChargers]
+  );
 
-  const stopCharging = useCallback(async (stationId: string) => {
-     // Esta funcionalidade precisará de um endpoint no backend
-     console.log("TODO: Implementar chamada de API para parar carregamento", stationId);
-  }, []);
+  const stopCharger = useCallback(
+    async (stationId: string) => {
+      try {
+        const response = await fetch(
+          `${API_BASE_URL}/carregadores/${stationId}`,
+          {
+            method: "DELETE",
+            headers: {
+              Authorization: `${TOKEN}`,
+            },
+          }
+        );
+        if (response.ok) {
+          fetchActiveChargers();
+        } else {
+          console.error("Falha ao parar carregador.");
+        }
+      } catch (error) {
+        console.error("Erro ao parar carregador:", error);
+      }
+    },
+    [fetchActiveChargers]
+  );
 
-  const toggleSimulation = useCallback(async () => {
-    // Esta funcionalidade precisará de um endpoint no backend
-    console.log("TODO: Implementar chamada de API para iniciar/parar simulação");
-  }, []);
+  const toggleBilling = useCallback(async () => {
+    const endpoint = isBillingRunning ? "stop" : "start";
+    try {
+      const response = await fetch(`${API_BASE_URL}/billing/${endpoint}`, {
+        method: "POST",
+        headers: {
+          Authorization: `${TOKEN}`,
+        },
+      });
 
+      if (response.ok) {
+        setIsBillingRunning(!isBillingRunning);
+      } else {
+        console.error("Falha ao alterar status do serviço de billing.");
+      }
+    } catch (error) {
+      console.error("Erro ao acionar o serviço de billing:", error);
+    }
+  }, [isBillingRunning]);
+
+  // NOVA FUNÇÃO PARA LIMPAR A SIMULAÇÃO
+  const clearSimulation = useCallback(async () => {
+    if (
+      !window.confirm(
+        "Tem certeza de que deseja limpar todos os carregadores e eventos? Esta ação não pode ser desfeita."
+      )
+    ) {
+      return;
+    }
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/limpar-carregadores-e-eventos`,
+        {
+          method: "DELETE",
+          headers: { Authorization: `${TOKEN}` },
+        }
+      );
+
+      if (response.ok) {
+        setEvents([]);
+        setStations([]);
+        fetchActiveChargers();
+      } else {
+        console.error("Falha ao limpar a simulação.");
+        alert("Ocorreu um erro ao tentar limpar a simulação.");
+      }
+    } catch (error) {
+      console.error("Erro ao limpar a simulação:", error);
+      alert("Ocorreu um erro ao tentar limpar a simulação.");
+    }
+  }, [fetchActiveChargers]);
 
   return (
     <div className="dark min-h-screen bg-background p-6">
       <div className="max-w-7xl mx-auto">
         <h1 className="text-center mb-8">
-          Dashboard de Carregamento de Veículos Elétricos - Simulação de Sistema Distribuído
+          Dashboard de Carregamento de Veículos Elétricos - Simulação de Sistema
+          Distribuído
         </h1>
 
         <div className="grid grid-cols-12 gap-6 h-[calc(100vh-12rem)]">
-          {/* Painel de Estações de Carregamento - Lado Esquerdo */}
           <div className="col-span-3 space-y-4">
             <h2>Estações de Carregamento</h2>
             <div className="grid grid-cols-1 gap-3 max-h-full overflow-y-auto">
@@ -166,21 +292,19 @@ export default function App() {
             </div>
           </div>
 
-          {/* Log de Eventos Globais - Centro */}
           <div className="col-span-6">
             <EventLog events={events} />
           </div>
 
-          {/* Painel de Controle - Lado Direito */}
           <div className="col-span-3">
             <ControlPanel
               stations={stations}
-              onAddVehicle={addVehicle}
-              onStartCharging={startCharging}
-              onStopCharging={stopCharging}
-              vehicleQueue={vehicleQueue}
-              isSimulationRunning={isSimulationRunning}
-              onToggleSimulation={toggleSimulation}
+              activeChargers={activeChargers}
+              onAddCharger={addCharger}
+              onStopCharger={stopCharger}
+              isBillingRunning={isBillingRunning}
+              onToggleBilling={toggleBilling}
+              onClearSimulation={clearSimulation}
             />
           </div>
         </div>
